@@ -575,6 +575,9 @@ impl ClientHandler {
                     } else {
                         record_worker_error(&instance_id, &wallet_addr, crate::errors::ErrorShortCode::FailedBlockFetch.as_str());
                         error!("send_immediate_job: failed fetching block template: {}", e);
+                        if e.to_string().contains(crate::kaspaapi::TEMPLATE_OUTAGE_MARKER) {
+                            client_clone.disconnect();
+                        }
                     }
                     return;
                 }
@@ -889,6 +892,9 @@ impl ClientHandler {
                         } else {
                             record_worker_error(&instance_id, &wallet_addr, crate::errors::ErrorShortCode::FailedBlockFetch.as_str());
                             error!("failed fetching new block template from kaspa: {}", e);
+                            if e.to_string().contains(crate::kaspaapi::TEMPLATE_OUTAGE_MARKER) {
+                                client_clone.disconnect();
+                            }
                         }
                         return;
                     }

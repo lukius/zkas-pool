@@ -242,8 +242,8 @@ pub struct KaspaApi {
 
     /// Real dual-chain merged mining: gRPC client to the upstream **Kaspa** node that
     /// supplies the parent block template and receives Kaspa-target-clearing blocks
-    /// (the KAS reward path). `None` ⇒ synthetic-parent merged mode (ZKas aux
-    /// blocks only, no KAS). Set from `ZKAS_KASPA_NODE` (or legacy `FIRECASH_KASPA_NODE`).
+    /// (the KAS reward path). Always `Some` in merged mode (startup refuses to run
+    /// ZKas-aux-only); `None` when not merging. Set from `ZKAS_KASPA_NODE` (or legacy `FIRECASH_KASPA_NODE`).
     kaspa_client: Option<Arc<GrpcClient>>,
     /// The `kaspa:` address each real parent's coinbase pays. Set from
     /// `ZKAS_KASPA_PAY` (or legacy `FIRECASH_KASPA_PAY`).
@@ -264,7 +264,19 @@ pub struct KaspaApi {
     /// use distinct H_fc commitments, so a single global mutex would serialize
     /// the entire fleet; unbounded fan-out would overload one gRPC route.
     kaspa_parent_rpc_gate: Arc<tokio::sync::Semaphore>,
+    /// When block templates started failing without a success since (merged mode).
+    /// Past [`TEMPLATE_OUTAGE_DISCONNECT`] the error carries
+    /// [`TEMPLATE_OUTAGE_MARKER`] so client handlers drop miners onto their backup pool.
+    template_failing_since: Mutex<Option<Instant>>,
 }
+
+/// How long merged-mode templates may keep failing before miners are disconnected.
+/// Short blips just skip a job (the miner keeps its last real-Kaspa-parent work);
+/// anything longer means stale KAS work, and a plain Kaspa bridge should take over.
+const TEMPLATE_OUTAGE_DISCONNECT: Duration = Duration::from_secs(15);
+
+/// Tag on a template error meaning "outage exceeded; disconnect the miner".
+pub const TEMPLATE_OUTAGE_MARKER: &str = "[template outage: disconnecting for failover]";
 
 /// How long a cached Kaspa parent is reused before refetching. Kaspa makes a tip
 /// ~every 100ms; 150ms keeps the parent fresh (low `BlockInvalid`) while collapsing the
@@ -437,12 +449,14 @@ impl KaspaApi {
 
         // Real dual-chain: connect to the upstream Kaspa node so the *same* solved
         // parent that yields a ZKas aux block also earns KAS when it clears the
-        // (harder) Kaspa target. Best-effort: if unset or unreachable, merged mining
-        // degrades to ZKas-aux-only rather than failing to start.
+        // (harder) Kaspa target. KAS takes priority: if unset or unreachable, refuse
+        // to start rather than degrade to ZKas-aux-only (the supervisor retries, and
+        // miners fail over to a plain Kaspa bridge meanwhile).
         let (kaspa_client, kaspa_pay) = if merged_mining {
             if node.is_empty() || pay.is_empty() {
-                info!("Real merged mining disabled (set ZKAS_KASPA_NODE + ZKAS_KASPA_PAY to also earn KAS); running ZKas-aux-only");
-                (None, None)
+                return Err(anyhow::anyhow!(
+                    "merged mining requires a Kaspa parent (set ZKAS_KASPA_NODE + ZKAS_KASPA_PAY); refusing to run ZKas-aux-only"
+                ));
             } else {
                 let grpc = if node.starts_with("grpc://") { node.clone() } else { format!("grpc://{node}") };
                 match GrpcClient::connect_with_args(
@@ -463,13 +477,13 @@ impl KaspaApi {
                             (Some(Arc::new(kc)), Some(addr))
                         }
                         Err(e) => {
-                            warn!("ZKAS_KASPA_PAY is not a valid kaspa: address ({e}); running ZKas-aux-only");
-                            (None, None)
+                            return Err(anyhow::anyhow!(
+                                "ZKAS_KASPA_PAY is not a valid kaspa: address ({e}); refusing to run ZKas-aux-only"
+                            ));
                         }
                     },
                     Err(e) => {
-                        warn!("could not connect to Kaspa node {node} ({e}); running ZKas-aux-only");
-                        (None, None)
+                        return Err(anyhow::anyhow!("could not connect to Kaspa node {node} ({e}); refusing to run ZKas-aux-only"));
                     }
                 }
             }
@@ -513,6 +527,7 @@ impl KaspaApi {
             kaspa_pay,
             kaspa_parent_cache: Arc::new(tokio::sync::Mutex::new(None)),
             kaspa_parent_rpc_gate: Arc::new(tokio::sync::Semaphore::new(4)),
+            template_failing_since: Mutex::new(None),
         });
 
         // Start network stats thread
@@ -639,7 +654,7 @@ impl KaspaApi {
     /// address and embedding `ZKMM || h_fc` in the coinbase `extra_data`, so a solved
     /// parent is a valid Kaspa block that both (a) can be submitted to Kaspa for KAS and
     /// (b) proves the ZKas block via AuxPoW. Errs if the Kaspa client/pay address is
-    /// unset (caller falls back to a synthetic parent).
+    /// unset (caller issues no job rather than a synthetic parent).
     ///
     /// `payee` overrides the pool address when a miner supplied its own `kaspa:`
     /// address in the stratum password. Passing `None` pays the pool, which is both
@@ -1212,15 +1227,12 @@ impl KaspaApi {
                                     // Real dual-chain: a genuine Kaspa block whose coinbase commits to
                                     // H_fc — clearing its (hard) target also earns KAS.
                                     Ok(p) => p,
-                                    // No/failed Kaspa node: fall back to a synthetic parent so ZKas
-                                    // aux blocks keep flowing (no KAS, but the chain stays live).
+                                    // No/failed Kaspa node: never hand out a synthetic parent (that
+                                    // work could not earn KAS). No job this round; a persistent
+                                    // failure disconnects miners so they fail over (see
+                                    // `TEMPLATE_OUTAGE_MARKER`).
                                     Err(e) => {
-                                        if self.kaspa_client.is_some() {
-                                            warn!(
-                                                "merged: Kaspa parent fetch failed ({e}); using synthetic parent this round (no KAS)"
-                                            );
-                                        }
-                                        crate::merged::build_parent_block(&block).0
+                                        return Err(anyhow::anyhow!("merged: Kaspa parent fetch failed ({e}); no ZKas-only job issued"));
                                     }
                                 };
                                 self.pending_fc.lock().insert_with_payee(h_fc, block, paid_pool);
@@ -1547,8 +1559,19 @@ impl KaspaApiTrait for KaspaApi {
         kas_payout: Option<Address>,
         lane_id: u64,
     ) -> Result<Block, Box<dyn std::error::Error + Send + Sync>> {
-        KaspaApi::get_block_template(self, wallet_addr, "", "", session_uid, generation, kas_payout, lane_id).await.map_err(|e| {
-            let error_msg = e.to_string();
+        let result = KaspaApi::get_block_template(self, wallet_addr, "", "", session_uid, generation, kas_payout, lane_id).await;
+        let outage = {
+            let mut since = self.template_failing_since.lock();
+            match &result {
+                Ok(_) => {
+                    *since = None;
+                    false
+                }
+                Err(_) => self.merged_mining && since.get_or_insert_with(Instant::now).elapsed() >= TEMPLATE_OUTAGE_DISCONNECT,
+            }
+        };
+        result.map_err(|e| {
+            let error_msg = if outage { format!("{TEMPLATE_OUTAGE_MARKER} {e}") } else { e.to_string() };
             Box::new(std::io::Error::other(error_msg)) as Box<dyn std::error::Error + Send + Sync>
         })
     }
