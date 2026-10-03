@@ -16,6 +16,7 @@ use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::sync::watch;
@@ -268,6 +269,9 @@ pub struct KaspaApi {
     /// Past [`TEMPLATE_OUTAGE_DISCONNECT`] the error carries
     /// [`TEMPLATE_OUTAGE_MARKER`] so client handlers drop miners onto their backup pool.
     template_failing_since: Mutex<Option<Instant>>,
+    /// Merged mode is currently serving KAS-only jobs because the ZKas node cannot
+    /// provide templates (see [`Self::fetch_kaspa_only_template`]).
+    kas_only: AtomicBool,
 }
 
 /// How long merged-mode templates may keep failing before miners are disconnected.
@@ -528,6 +532,7 @@ impl KaspaApi {
             kaspa_parent_cache: Arc::new(tokio::sync::Mutex::new(None)),
             kaspa_parent_rpc_gate: Arc::new(tokio::sync::Semaphore::new(4)),
             template_failing_since: Mutex::new(None),
+            kas_only: AtomicBool::new(false),
         });
 
         // Start network stats thread
@@ -687,12 +692,54 @@ impl KaspaApi {
         Ok(parent)
     }
 
+    /// KAS-only fallback for merged mode: a plain Kaspa block template (no ZKas
+    /// commitment) from the Kaspa node, for when the ZKas node cannot provide work.
+    /// Miners stay connected and keep mining KAS instead of being dropped; merged
+    /// jobs resume as soon as a ZKas template succeeds again.
+    ///
+    /// A job built from this carries no `ZKMM` commitment, which the rest of the
+    /// merged path already treats as "not a ZKas job": the share handler validates
+    /// it against the Kaspa target, submits a solved block to Kaspa only (see
+    /// [`Self::claim_network_solution`]) and parent refreshes fetch fresh KAS-only
+    /// templates (see [`Self::refresh_merged_parent`]).
+    async fn fetch_kaspa_only_template(&self, payee: Option<&Address>, extra_data: Vec<u8>) -> Result<Block> {
+        let kc = self.kaspa_client.as_ref().ok_or_else(|| anyhow::anyhow!("no Kaspa node client"))?;
+        let pay = match payee {
+            Some(a) => a.clone(),
+            None => self.kaspa_pay.clone().ok_or_else(|| anyhow::anyhow!("no Kaspa pay address"))?,
+        };
+        let _permit = self.kaspa_parent_rpc_gate.acquire().await.context("Kaspa parent RPC gate closed")?;
+        let resp = kc
+            .get_block_template_call(None, GetBlockTemplateRequest::new(pay, extra_data))
+            .await
+            .context("kaspa getBlockTemplate (KAS-only)")?;
+        Block::try_from(resp.block).map_err(|e| anyhow::anyhow!("kaspa block conversion: {e:?}"))
+    }
+
+    /// Record whether jobs are currently KAS-only, logging only on a change of mode.
+    fn set_kas_only(&self, kas_only: bool, reason: &str) {
+        if self.kas_only.swap(kas_only, Ordering::Relaxed) != kas_only {
+            if kas_only {
+                warn!("{} ZKas templates unavailable ({reason}); serving KAS-only jobs", LogColors::block("[MERGED]"));
+            } else {
+                info!("{} ZKas templates available again; back to merged jobs", LogColors::block("[MERGED]"));
+            }
+        }
+    }
+
+    /// Whether jobs are currently KAS-only (ZKas node unavailable).
+    pub fn is_kas_only(&self) -> bool {
+        self.kas_only.load(Ordering::Relaxed)
+    }
+
     pub async fn refresh_merged_parent(&self, current_parent: &Block, payee: Option<&Address>) -> Result<Option<Block>> {
         if !self.merged_mining || self.kaspa_client.is_none() {
             return Ok(None);
         }
-        let h_fc =
-            crate::merged::committed_h_fc(current_parent).ok_or_else(|| anyhow::anyhow!("merged parent has no ZKMM commitment"))?;
+        // A job without a commitment is KAS-only work: keep it fresh on the Kaspa clock.
+        let Some(h_fc) = crate::merged::committed_h_fc(current_parent) else {
+            return self.fetch_kaspa_only_template(payee, self.coinbase_tag.clone()).await.map(Some);
+        };
         if !self.pending_fc.lock().is_unsolved(&h_fc) {
             return Ok(None);
         }
@@ -742,8 +789,11 @@ impl KaspaApi {
         if !self.merged_mining {
             return true;
         }
+        // No commitment in merged mode means a KAS-only job: its solution was already
+        // submitted to Kaspa by `submit_merged_parent_if_solved`, and there is no ZKas
+        // block to submit.
         let Some(h_fc) = crate::merged::committed_h_fc(job_block) else {
-            return true;
+            return false;
         };
         self.pending_fc.lock().claim_solution(h_fc)
     }
@@ -1137,6 +1187,22 @@ impl KaspaApi {
         Ok(())
     }
 
+    /// What the bridge can mine right now, for the health endpoint: `"merged"` when the
+    /// ZKas and Kaspa nodes are both synced, `"kas-only"` when only the Kaspa node is
+    /// (see [`Self::fetch_kaspa_only_template`]), `"native"` for a synced ZKas node
+    /// outside merged mode, and `None` when no work can be issued.
+    pub async fn mining_mode(&self) -> Option<&'static str> {
+        let zkas_synced = matches!(self.client.get_sync_status().await, Ok(true));
+        if !self.merged_mining {
+            return zkas_synced.then_some("native");
+        }
+        let kc = self.kaspa_client.as_ref()?;
+        if !matches!(kc.get_sync_status().await, Ok(true)) {
+            return None;
+        }
+        Some(if zkas_synced { "merged" } else { "kas-only" })
+    }
+
     /// Check if connected
     pub fn is_connected(&self) -> bool {
         *self.connected.lock()
@@ -1178,9 +1244,16 @@ impl KaspaApi {
             // The node's canonical cached-template modifier performs all
             // consensus serialization; the bridge must not hand-build it.
             let coinbase_tag = build_lane_coinbase_tag(&self.coinbase_tag, session_uid, generation);
-            let response = match self.client.get_block_template_call(None, GetBlockTemplateRequest::new(address, coinbase_tag)).await {
+            let response = match self.client.get_block_template_call(None, GetBlockTemplateRequest::new(address, coinbase_tag.clone())).await
+            {
                 Ok(r) => r,
                 Err(e) => {
+                    // Merged mode: KAS takes priority over ZKas, so don't retry the ZKas
+                    // node -- keep the miner on KAS-only work right away instead.
+                    if self.merged_mining && self.kaspa_client.is_some() {
+                        self.set_kas_only(true, &e.to_string());
+                        return self.fetch_kaspa_only_template(kas_payout.as_ref(), coinbase_tag).await;
+                    }
                     if attempt < max_retries - 1 {
                         warn!("Failed to get block template (attempt {}/{}): {}, retrying...", attempt + 1, max_retries, e);
                         sleep(Duration::from_millis(100 * (attempt + 1) as u64)).await;
@@ -1236,6 +1309,7 @@ impl KaspaApi {
                                     }
                                 };
                                 self.pending_fc.lock().insert_with_payee(h_fc, block, paid_pool);
+                                self.set_kas_only(false, "");
                                 return Ok(parent);
                             }
                             return Ok(block);
