@@ -279,12 +279,6 @@ async fn main() -> Result<(), anyhow::Error> {
 
     log_bridge_configuration(&config);
 
-    // Start global health check server if port is specified
-    if !config.global.health_check_port.is_empty() {
-        let health_port = config.global.health_check_port.clone();
-        health_check::spawn_health_check_server(health_port);
-    }
-
     // Create shared kaspa API client (all instances use the same node)
     // katpool fork divergence: KaspaApi::new accepts an optional
     // `coinbase_address_override` for custodial PROP-pool mode (every block
@@ -304,6 +298,13 @@ async fn main() -> Result<(), anyhow::Error> {
     )
     .await
     .map_err(|e| anyhow::anyhow!("Failed to create Kaspa API client: {}", e))?;
+
+    // Start global health check server if port is specified. It reports node
+    // readiness, so it starts once the node clients exist.
+    if !config.global.health_check_port.is_empty() {
+        let health_port = config.global.health_check_port.clone();
+        health_check::spawn_health_check_server(health_port, Arc::clone(&kaspa_api));
+    }
 
     if !config.global.web_dashboard_port.is_empty() {
         let web_dashboard_port = config.global.web_dashboard_port.clone();
