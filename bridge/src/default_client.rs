@@ -277,6 +277,25 @@ pub async fn handle_authorize(
     };
     tracing::debug!("[AUTHORIZE] Cleaned address: '{}'", address);
 
+    // A Kaspa address as the username cannot be a ZKas coinbase (the node rejects its
+    // prefix, which disconnects the miner in a loop). Take it as the miner's KAS payout
+    // instead and mine the ZKas side to the pool fallback address. This lets a single
+    // `kaspa:` username work both here and on a plain Kaspa bridge behind a failover
+    // proxy. An explicit password payout still wins (see below).
+    let mut username_kas_payout = None;
+    if address.starts_with("kaspa:") || address.starts_with("kaspatest:") || address.starts_with("kaspadev:") {
+        username_kas_payout = Address::try_from(address.as_str()).ok();
+        let fallback = pool_fallback_address();
+        tracing::info!(
+            "[AUTHORIZE] {}:{} Kaspa username {}: KAS rewards -> it, ZKas coinbase -> pool fallback ({})",
+            ctx.remote_addr,
+            ctx.remote_port,
+            address,
+            fallback
+        );
+        address = fallback;
+    }
+
     tracing::debug!("[AUTHORIZE] Final parsed - address: '{}', worker: '{}', canxium: '{}'", address, worker_name, canxium_address);
 
     if let Some(ref client_handler) = client_handler {
@@ -310,7 +329,7 @@ pub async fn handle_authorize(
     // pool" — the miner keeps mining and keeps earning ZKas normally. That is the
     // forgiving choice, but it is also a silent one: a typo donates this miner's KAS
     // to the pool indefinitely, so it is logged at WARN with the offending value.
-    let kas_payout = parse_kas_payout(event.params.get(1).and_then(|v| v.as_str()));
+    let kas_payout = parse_kas_payout(event.params.get(1).and_then(|v| v.as_str())).or(username_kas_payout);
     match &kas_payout {
         Some(addr) => {
             tracing::info!(
