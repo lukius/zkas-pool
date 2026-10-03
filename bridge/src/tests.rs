@@ -2619,6 +2619,19 @@ mod comprehensive_tests {
     }
 
     #[tokio::test]
+    async fn test_kaspa_username_becomes_kas_payout() {
+        // A Kaspa username is the KAS payout; the ZKas coinbase goes to the pool
+        // fallback, so the same username works on a plain Kaspa bridge too.
+        let kaspa_addr = "kaspa:qqkqkzjvr7zwxxmjxjkmxxdwju9kjs6e9u82uh59z07vgaks6gg62v8707g73";
+        let ctx = create_test_context().await;
+        let event = JsonRpcEvent::new(Some("1".to_string()), "mining.authorize", vec![json!(kaspa_addr), json!("x")]);
+        let _ = handle_authorize(ctx.clone(), event, None, None).await;
+
+        assert!(ctx.wallet_addr.lock().starts_with("zkas:"), "ZKas coinbase must not pay a kaspa: address");
+        assert_eq!(ctx.kas_payout.lock().as_ref().map(|a| a.to_string()).as_deref(), Some(kaspa_addr));
+    }
+
+    #[tokio::test]
     async fn test_wallet_address_cleaning_without_prefix() {
         // Test: Wallet addresses without prefix should get kaspa: prefix added
         let ctx = create_test_context().await;
