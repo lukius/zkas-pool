@@ -705,7 +705,7 @@ impl KaspaApi {
     /// Miners stay connected and keep mining KAS instead of being dropped; merged
     /// jobs resume as soon as a ZKas template succeeds again.
     ///
-    /// A job built from this carries no `ZKMM` commitment, which the rest of the
+    /// A job built from this carries no `ZKMM`/`ZKM1` commitment, which the rest of the
     /// merged path already treats as "not a ZKas job": the share handler validates
     /// it against the Kaspa target, submits a solved block to Kaspa only (see
     /// [`Self::claim_network_solution`]) and parent refreshes fetch fresh KAS-only
