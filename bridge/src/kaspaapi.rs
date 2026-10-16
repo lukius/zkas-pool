@@ -1146,10 +1146,22 @@ impl KaspaApi {
         result
     }
 
+    /// Whether the node that gates work is synced. In merged mode that is the Kaspa
+    /// parent node: KAS takes priority, and an unsynced ZKas node only means KAS-only
+    /// jobs (see [`Self::fetch_kaspa_only_template`]), not no jobs. Otherwise it is the
+    /// ZKas node.
+    async fn work_node_synced(&self) -> Result<bool> {
+        let synced = match (&self.kaspa_client, self.merged_mining) {
+            (Some(kc), true) => kc.get_sync_status().await,
+            _ => self.client.get_sync_status().await,
+        };
+        synced.map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
     /// Wait for node to sync
     async fn wait_for_sync(&self) -> Result<()> {
         loop {
-            match self.client.get_sync_status().await {
+            match self.work_node_synced().await {
                 Ok(is_synced) => {
                     if is_synced {
                         break;
@@ -1178,8 +1190,15 @@ impl KaspaApi {
             return Ok(());
         }
 
+        // Merged mode starts on the Kaspa node alone (see `work_node_synced`).
+        let node_desc = if self.merged_mining && self.kaspa_client.is_some() {
+            "the Kaspa parent node".to_string()
+        } else {
+            format!("ZKas RPC at {}", self.zkas_node_endpoint)
+        };
+
         loop {
-            let sync_fut = self.client.get_sync_status();
+            let sync_fut = self.work_node_synced();
             let sync_res = tokio::select! {
                 _ = shutdown_rx.wait_for(|v| *v) => {
                     return Err(anyhow::anyhow!("shutdown requested"));
@@ -1200,8 +1219,8 @@ impl KaspaApi {
             }
 
             warn!(
-                "Connected to ZKas RPC at {}, but GetSyncStatus returned false; waiting for the node to become mining-ready",
-                self.zkas_node_endpoint
+                "Connected to {}, but GetSyncStatus returned false; waiting for the node to become mining-ready",
+                node_desc
             );
 
             tokio::select! {
@@ -1290,6 +1309,13 @@ impl KaspaApi {
                     return Err(anyhow::anyhow!("Failed to get block template after {} attempts: {}", max_retries, e));
                 }
             };
+
+            // A syncing ZKas node still answers, with a template on its stale tip: a ZKas
+            // block mined from it is worthless. In merged mode treat it like no template.
+            if !response.is_synced && self.merged_mining && self.kaspa_client.is_some() {
+                self.set_kas_only(true, "ZKas node not synced");
+                return self.fetch_kaspa_only_template(kas_payout.as_ref(), coinbase_tag).await;
+            }
 
             // Get RPC block from response
             let rpc_block = response.block;
